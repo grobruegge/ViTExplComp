@@ -31,10 +31,15 @@ Some method work based on superpixels (e.g., LIME), and other method work on low
 
 In order for the scripts to work, install the packages specified in the `requirements.txt` file. 
 
+The repository uses the dataset Imagenette with full-sized images (https://github.com/fastai/imagenette): "Imagenette is a subset of 10 easily classified classes from Imagenet (tench, English springer, cassette player, chain saw, church, French horn, garbage truck, gas pump, golf ball, parachute)".
+
+Download the dataset from the link provided in the repository and put it in `data/`. Taken from the creators repository: 
+
 ### Reconstructing results
 
 Simply execute the script `run_comparison.py`. You can pass the following arguments depending on your needs:
 
-- `--methods <...>`: Select the methods you want to run the comparison on (default: all)
-- `--idx_sample_img <idx> `: The script will create saliency maps for one example image; with this argument you can pass the desired index (default: 0)
+- `--methods <method1 method2>`: Select the methods you want to run the comparison on (default: all)
+- `--idx_sample_img <int> `: The script will create saliency maps for one example image; with this argument you can pass the desired index (default: 0)
 - `--save_attr_maps`: Whether to save the computed attribution map as .pickle-file.
+- `--sample_size <int>`: If provided, only use sample_size images to compute metrics (fast execution, for developing/testing)

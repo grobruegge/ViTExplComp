@@ -154,6 +154,7 @@ cython_debug/
 
 # data 
 *.png
+*.JPEG
+/data/imagenet-sample-images
 *.ipynb
-data/
 *.pickle
