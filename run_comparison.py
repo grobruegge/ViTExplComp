@@ -1,6 +1,6 @@
 import os
 import sys
-
+# sbatch -n1 -p sdil --time=2500 --gres=gpu:1 --wrap 'python run_comparison.py --save_attr_map'
 # necessary to access the intermediate attention layers of ViT architecture
 os.environ["TIMM_FUSED_ATTN"] = '0'
 # add folder that contains script for running transformer explainability to sys path
@@ -18,6 +18,8 @@ from matplotlib import pyplot as plt
 from transformer_explainability.vit_explaination_generator import LRP 
 import vit_rollout
 from transformer_explainability.vit_lrp import vit_base_patch16_224 as vit_LRP
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 import cv2
 from tqdm import tqdm
 from captum.attr import IntegratedGradients, KernelShap, GradientShap
@@ -35,7 +37,7 @@ class ImagenetteDataset(Dataset):
         self.root_path = os.path.join('data', 'imagenette2')
         class_paths = os.listdir(os.path.join(self.root_path, 'train'))
         self.data = []
-        for class_path in class_paths:
+        for class_path in class_paths[:8]:
             # these are the standard training images of ImageNet1k
             for split in ['train', 'val']:
                 for img_path in os.listdir(os.path.join(self.root_path, split, class_path)):
@@ -125,7 +127,7 @@ def get_attr_map_lime(model, device, lime_explainer, image, label):
         labels=label.cpu().numpy(),
         top_labels=None, 
         hide_color=0, 
-        num_samples=1000,
+        num_samples=750,
         # progress_bar=False, # should be available
         )
 
@@ -145,7 +147,7 @@ def get_attr_map_ig(ig_explainer, image, label):
     attr_map = ig_explainer.attribute(image, target=label)
     attr_map = attr_map.squeeze().cpu().detach().numpy().transpose(1,2,0)
 
-    return postprocess_pixel_mask(create_binary_mask(attr_map))
+    return create_binary_mask(attr_map) #postprocess_pixel_mask(create_binary_mask(attr_map))
 
 # Transformer Interpretability Beyond Attention Visualization
 # https://github.com/hila-chefer/Transformer-Explainability
@@ -162,6 +164,7 @@ def get_attr_map_beyond_attention(attribution_generator, image, label):
 # https://github.com/jacobgil/vit-explain
 def get_attr_map_attn_rollout(attn_rollout, image):
 
+    # class-agnostic by definition which is why not label is passed
     attr_map = attn_rollout(image)
 
     attr_map = cv2.resize(attr_map, (224, 224))
@@ -205,6 +208,13 @@ def get_attr_map_gradient_shap(gradient_shap_explainer, image, label, device):
 
     return postprocess_pixel_mask(create_binary_mask(attr_map))
 
+def get_attr_map_grad_cam(grad_cam_explainer, image, labels):
+    
+    targets = [ClassifierOutputTarget(labels[idx]) for idx in range(labels.size(0))]
+    attr_map = grad_cam_explainer(input_tensor=image, targets=targets)
+
+    return create_binary_mask(attr_map[0])
+
 def get_attr_maps(args, model, device, dataloader):
     
     # initialize dict to store the attribution maps for each method
@@ -223,40 +233,60 @@ def get_attr_maps(args, model, device, dataloader):
     kernel_shap_explainer = KernelShap(model)
     gradient_shap_explainer = GradientShap(model)
 
+    # {OPTION-1} Take the output of the norm-layer before the last attention layer
+    # (size: [batch_size, num_tokens(197), feature_dim(192)]), disregard the <CLS> token and reshape 
+    # the tensor to [batch_size, feature_dim(192), width(14), height(14)] and finally multiply this with its 
+    # gradients and averages over the feature_dim-axis.
+    # {OPTION-2} One could take the last layer attention matrix, i.e. the output of the Dropout-
+    # layer (dropout-rate at 0) of size [batch_size, num_attn_heads(12),num_tokens(197), num_tokens(197)],
+    # multiply this with its gradient and average over the attention heads.
+    def reshape_transform(tensor, height=14, width=14):
+        result = tensor[:, 1 :  , :].reshape(tensor.size(0), height, width, tensor.size(2)) #{OPTION-1}
+        result = result.transpose(2, 3).transpose(1, 2) #{OPTION-1}
+        #result = tensor[:,: ,0, 1:].reshape(tensor.size(0), tensor.size(1), height, width) #{OPTION-2}
+        return result
+    target_layers = [model.blocks[-1].norm1] #[model.blocks[-1].attn.attn_drop] {OPTION-2}
+    grad_cam_explainer = GradCAM(model=model, target_layers=target_layers, reshape_transform=reshape_transform)
+
     # iterate through the images
-    for image, label in tqdm(dataloader, desc="Iterate through dataset:"):
+    for images, labels in tqdm(dataloader, desc="Iterate through dataset:"):
         
-        label, image = label.to(device), image.to(device)
+        labels, images = labels.to(device), images.to(device)
 
-        ## LIME ##
-        attr_maps["LIME"].append(
-            get_attr_map_lime(model, device, lime_explainer, image, label)
-        )
+        if "LIME" in args.methods: ## LIME ##
+            attr_maps["LIME"].append(
+                get_attr_map_lime(model, device, lime_explainer, images, labels)
+            )
 
-        ## IntegratedGradients ##
-        attr_maps["IntegratedGradients"].append(
-            get_attr_map_ig(ig_explainer, image, label)
-        )
+        if "KernelSHAP" in args.methods:  ## KernelSHAP ##
+            attr_maps["KernelSHAP"].append(
+                get_attr_map_kernel_shap(kernel_shap_explainer, images, labels, device)
+            )
 
-        ## Transformer Explainability beyond Attention ##
-        attr_maps["BeyondAttention"].append(
-            get_attr_map_beyond_attention(attribution_generator, image, label)
-        )
+        if "IntegratedGradients" in args.methods: ## IntegratedGradients ##
+            attr_maps["IntegratedGradients"].append(
+                get_attr_map_ig(ig_explainer, images, labels)
+            )
 
-        ## Attention Rollout ##
-        attr_maps["AttentionRollout"].append(
-            get_attr_map_attn_rollout(attn_rollout, image)
-        )
+        if "GradientSHAP" in args.methods: ## GradientSHAP ##
+            attr_maps["GradientSHAP"].append(
+                get_attr_map_gradient_shap(gradient_shap_explainer, images, labels, device)
+            )
 
-        ## KernelSHAP ##
-        attr_maps["KernelSHAP"].append(
-            get_attr_map_kernel_shap(kernel_shap_explainer, image, label, device)
-        )
+        if "AttentionRollout" in args.methods: ## Attention Rollout ##
+            attr_maps["AttentionRollout"].append(
+                get_attr_map_attn_rollout(attn_rollout, images)
+            )
 
-        ## GradientSHAP ##
-        attr_maps["GradientSHAP"].append(
-            get_attr_map_gradient_shap(gradient_shap_explainer, image, label, device)
-        )
+        if "BeyondAttention" in args.methods: ## Transformer Explainability beyond Attention ##
+            attr_maps["BeyondAttention"].append(
+                get_attr_map_beyond_attention(attribution_generator, images, labels)
+            )
+
+        if "GradCAM" in args.methods: ## Grad-CAM ##
+            attr_maps["GradCAM"].append(
+                get_attr_map_grad_cam(grad_cam_explainer, images, labels)
+            )
 
     # create a numpy array for each explanaition method
     for key, value in attr_maps.items():
@@ -269,18 +299,24 @@ def get_attr_maps(args, model, device, dataloader):
     return attr_maps
 
 def plot_test_images(args, dataloader, attr_maps, idx2label):
-    
-    image, label = next(iter(dataloader))
 
-    fig, axes = plt.subplots(1, len(args.methods), figsize=(len(args.methods) * 16, 16))
+    for i, (image, label) in enumerate(dataloader):
+        if i == args.idx_sample_img:
+            break
+    
+    num_methods = len(args.methods)
+    if num_methods == 1:
+        num_methods += 1
+
+    fig, axes = plt.subplots(1, num_methods, figsize=(num_methods * 16, 16))
 
     for idx, method in enumerate(args.methods):
         axes[idx].imshow(image[0].numpy().transpose(1,2,0))
         axes[idx].imshow(attr_maps[method][0], cmap='jet', alpha=0.7)
-        axes[idx].set_title(f"Method: {method}", fontsize=25)
+        axes[idx].set_title(f"Method: {method}", fontsize=60)
         axes[idx].axis('off')
 
-    fig.suptitle(f"Class Label: {idx2label[label.numpy()[0]]}", fontsize=30)
+    fig.suptitle(f"Class Label: {idx2label[label.numpy()[0]]}", fontsize=80)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig("sample_attr_maps.png")
 
@@ -288,28 +324,24 @@ def calculate_metrics(args, attr_maps):
     def calculate_iou(masks1, masks2):
         intersection = np.logical_and(masks1, masks2)
         union = np.logical_or(masks1, masks2)
-        iou_score = np.sum(intersection, axis=(1,2)) / np.sum(union, axis=(1,2))
+        denominator = np.sum(union, axis=(1,2)) # avoid division by 0
+        iou_score = np.sum(intersection, axis=(1,2)) / np.where(denominator == 0, 1, denominator)
         return np.mean(iou_score, axis=0)
     def calculate_dice_coefficient(masks1, masks2):
         intersection = np.logical_and(masks1, masks2)
-        dice_coefficient = (2 * np.sum(intersection, axis=(1,2))) / (np.sum(masks1, axis=(1,2)) + np.sum(masks2, axis=(1,2)))
+        denominator = np.sum(masks1, axis=(1,2)) + np.sum(masks2, axis=(1,2)) # avoid division by 0
+        dice_coefficient = (2 * np.sum(intersection, axis=(1,2))) / np.where(denominator == 0, 1, denominator)
         return np.mean(dice_coefficient, axis=0)
-    def calculate_pixel_accuracy(masks1, masks2):
-        num_pixels = masks1.shape[-1] * masks1.shape[-2]
-        pixel_accuracy = np.sum(masks1 == masks2, axis=(1,2)) / num_pixels
-        return np.mean(pixel_accuracy, axis=0)
 
     dict_metrics = {
         "IoU": {},
         "DiceCoefficient": {},
-        "PixelAccuracy": {},
-    }
+    }     
 
     # iterate through all possible combination of explainability method and calculate the metrics
     for pair in itertools.combinations(args.methods, r=2):
         dict_metrics["IoU"][(pair[0], pair[1])] = calculate_iou(attr_maps[pair[0]], attr_maps[pair[1]])
         dict_metrics["DiceCoefficient"][(pair[0], pair[1])] = calculate_dice_coefficient(attr_maps[pair[0]], attr_maps[pair[1]])
-        dict_metrics["PixelAccuracy"][(pair[0], pair[1])] = calculate_pixel_accuracy(attr_maps[pair[0]], attr_maps[pair[1]])
 
     return dict_metrics 
 
@@ -337,10 +369,12 @@ def plot_metrics_heatmaps(args, dict_metrics):
         axes[idx].set_title(metric_name, fontsize=25)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig("metrics_heatmaps.png")
+    #plt.savefig("metrics_heatmaps.png", dpi=600)
+    plt.savefig("metrics_heatmaps.pdf", format="pdf", dpi=300, bbox_inches="tight")
+    plt.savefig("metrics_heatmaps.svg", format="svg", dpi=600, bbox_inches="tight")
 
 if __name__ == "__main__":
-
+    
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Working on device: {DEVICE}")
     BATCH_SIZE = 1 # most explainability methods do not support batches
@@ -350,13 +384,13 @@ if __name__ == "__main__":
     parser.add_argument(
         '--methods', 
         nargs='+', 
-        default=['LIME', 'IntegratedGradients', 'BeyondAttention', 'AttentionRollout', 'KernelSHAP', 'GradientSHAP'], 
-        choices=['LIME', 'IntegratedGradients', 'BeyondAttention', 'AttentionRollout', 'KernelSHAP', 'GradientSHAP'],
+        default=['LIME', 'IntegratedGradients', 'BeyondAttention', 'AttentionRollout', 'KernelSHAP', 'GradientSHAP', 'GradCAM'], 
+        choices=['LIME', 'IntegratedGradients', 'BeyondAttention', 'AttentionRollout', 'KernelSHAP', 'GradientSHAP', 'GradCAM'],
         help='Specify the explainability method to compare'
     )
-    parser.add_argument('--idx_sample_img', type=int, default=0, help='Index of a sample image to plot for each method')
+    parser.add_argument('--idx_sample_img', type=int, default=None, help='Index of a sample image to plot for each method')
     parser.add_argument('--save_attr_maps', action='store_true', help='Whether to save the computed attribution maps for each method')
-    parser.add_argument('--subset_size', type=int, default=None, help='Index of a sample image to plot for each method')
+    parser.add_argument('--subset_size', type=int, default=None, help='Size of subset to run comparison on')
 
     args = parser.parse_args()
 
@@ -397,8 +431,8 @@ if __name__ == "__main__":
     dataset = ImagenetteDataset(transform, class_path_to_label, args.subset_size)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    if os.path.isfile('./attr_maps.pickle'):
-        with open('attr_maps.pickle', 'rb') as f:
+    if os.path.isfile('./attr_maps_imagenette_without_morph.pickle'):
+        with open('attr_maps_imagenette_without_morph.pickle', 'rb') as f:
             attr_maps = pickle.load(f)
         print(f"Loaded attribution maps from cache")
     else: 
