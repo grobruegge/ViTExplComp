@@ -93,7 +93,7 @@ def create_binary_mask(attr_map: np.ndarray) -> np.ndarray:
 
 # in case of binary mask on pixel level, this function applies some smoothing
 # techniques to create unified saliency regions
-def postprocess_pixel_mask(mask, percentile=80):
+def postprocess_pixel_mask(mask, percentile=85):
 
     # connect closely located pixels and fill holes
     mask_closed = ndimage.grey_closing(mask, structure=np.ones((6, 6)))
@@ -431,8 +431,8 @@ if __name__ == "__main__":
     dataset = ImagenetteDataset(transform, class_path_to_label, args.subset_size)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    if os.path.isfile('./attr_maps_imagenette_without_morph.pickle'):
-        with open('attr_maps_imagenette_without_morph.pickle', 'rb') as f:
+    if os.path.isfile('./attr_maps.pickle'):
+        with open('attr_maps.pickle', 'rb') as f:
             attr_maps = pickle.load(f)
         print(f"Loaded attribution maps from cache")
     else: 
